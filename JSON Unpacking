@@ -1,0 +1,400 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
+import pathlib
+import pandas as pd
+from gspread.utils import rowcol_to_a1
+
+currentweek = 15
+previousweek = currentweek - 1
+
+# -------------------------
+# GOOGLE SHEETS AUTH
+# -------------------------
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = ServiceAccountCredentials.from_json_keyfile_name(
+    "credentials.json", scope
+)
+client = gspread.authorize(creds)
+
+sheet = client.open("Anytime TD Bot").worksheet(f"Week{currentweek}_2025") # ALSO CHANGE THIS LATER
+
+# -------------------------
+# LOAD PLAYER-TEAM MAPPING FROM SCRIPT 1
+# -------------------------
+
+with open("player_team_mapping.json", "r") as f:
+    player_team_mapping = json.load(f)
+
+df_players = pd.DataFrame(player_team_mapping)
+
+print(f"✅ Loaded {len(df_players)} players from mapping file")
+
+# -------------------------
+# READ OPPONENT NAMES FROM SHEET (Written by Script 1)
+# -------------------------
+
+DATA_START_ROW = 2
+opponent_data = sheet.get("J3:J500")
+
+opponents = [row[0] if row else "Unknown" for row in opponent_data[:len(df_players)]]
+df_players["opponent_name"] = opponents
+
+print(f"✅ Read opponent names from sheet")
+
+# -------------------------
+# TEAM LOOKUP
+# -------------------------
+
+team_lookup = {
+    "2": {"abbreviation": "BUF", "displayName": "Buffalo Bills", "ESPN ID": "2"},
+    "20": {"abbreviation": "NYJ", "displayName": "New York Jets", "ESPN ID": "20"},
+    "15": {"abbreviation": "MIA", "displayName": "Miami Dolphins", "ESPN ID": "15"},
+    "17": {"abbreviation": "NE", "displayName": "New England Patriots", "ESPN ID": "17"},
+    "7": {"abbreviation": "DEN", "displayName": "Denver Broncos", "ESPN ID": "7"},
+    "12": {"abbreviation": "KC", "displayName": "Kansas City Chiefs", "ESPN ID": "12"},
+    "13": {"abbreviation": "LV", "displayName": "Las Vegas Raiders", "ESPN ID": "13"},
+    "24": {"abbreviation": "LAC", "displayName": "Los Angeles Chargers", "ESPN ID": "24"},
+    "23": {"abbreviation": "PIT", "displayName": "Pittsburgh Steelers", "ESPN ID": "23"},
+    "4": {"abbreviation": "CIN", "displayName": "Cincinnati Bengals", "ESPN ID": "4"},
+    "33": {"abbreviation": "BAL", "displayName": "Baltimore Ravens", "ESPN ID": "33"},
+    "5": {"abbreviation": "CLE", "displayName": "Cleveland Browns", "ESPN ID": "5"},
+    "11": {"abbreviation": "IND", "displayName": "Indianapolis Colts", "ESPN ID": "11"},
+    "34": {"abbreviation": "HOU", "displayName": "Houston Texans", "ESPN ID": "34"},
+    "10": {"abbreviation": "TEN", "displayName": "Tennessee Titans", "ESPN ID": "10"},
+    "30": {"abbreviation": "JAX", "displayName": "Jacksonville Jaguars", "ESPN ID": "30"},
+    "3": {"abbreviation": "CHI", "displayName": "Chicago Bears", "ESPN ID": "3"},
+    "9": {"abbreviation": "GB", "displayName": "Green Bay Packers", "ESPN ID": "9"},
+    "16": {"abbreviation": "MIN", "displayName": "Minnesota Vikings", "ESPN ID": "16"},
+    "8": {"abbreviation": "DET", "displayName": "Detroit Lions", "ESPN ID": "8"},
+    "27": {"abbreviation": "TB", "displayName": "Tampa Bay Buccaneers", "ESPN ID": "27"},
+    "29": {"abbreviation": "CAR", "displayName": "Carolina Panthers", "ESPN ID": "29"},
+    "18": {"abbreviation": "NO", "displayName": "New Orleans Saints", "ESPN ID": "18"},
+    "1": {"abbreviation": "ATL", "displayName": "Atlanta Falcons", "ESPN ID": "1"},
+    "25": {"abbreviation": "SF", "displayName": "San Francisco 49ers", "ESPN ID": "25"},
+    "26": {"abbreviation": "SEA", "displayName": "Seattle Seahawks", "ESPN ID": "26"},
+    "22": {"abbreviation": "ARI", "displayName": "Arizona Cardinals", "ESPN ID": "22"},
+    "14": {"abbreviation": "LAR", "displayName": "Los Angeles Rams", "ESPN ID": "14"},
+    "28": {"abbreviation": "WSH", "displayName": "Washington Commanders", "ESPN ID": "28"},
+    "19": {"abbreviation": "NYG", "displayName": "New York Giants", "ESPN ID": "19"},
+    "6": {"abbreviation": "DAL", "displayName": "Dallas Cowboys", "ESPN ID": "6"},
+    "21": {"abbreviation": "PHI", "displayName": "Philadelphia Eagles", "ESPN ID": "21"}
+}
+
+espn_id_to_name = {v["ESPN ID"]: v["displayName"] for v in team_lookup.values()}
+
+# -------------------------
+# LOAD TEAM STATS
+# -------------------------
+
+Base_directory = pathlib.Path(__file__).parent
+team_stats_directory = Base_directory / "Team Stats (aggregated)"
+
+
+def extract_stat_rank(categories, category_name, stat_name):
+    """Extract rank from a specific stat category (used for opponent/defense only)"""
+    for category in categories:
+        if category["name"] == category_name:
+            for stat in category["stats"]:
+                if stat["name"] == stat_name:
+                    return stat.get("rank", 99)
+    return 99
+
+
+def extract_stat_value(categories, category_name, stat_name):
+    """Extract raw float value from a stat category (used for own offense)"""
+    for category in categories:
+        if category["name"] == category_name:
+            for stat in category["stats"]:
+                if stat["name"] == stat_name:
+                    try:
+                        return float(stat.get("value", 0))
+                    except (TypeError, ValueError):
+                        return 0.0
+    return 0.0
+
+
+def compute_offensive_ranks(raw_rush, raw_pass):
+    """
+    Given dicts of {abbr: yards_per_game}, compute ranks across all teams.
+    Rank 1 = most yards = best offense.
+    Returns two dicts: {abbr: rush_rank}, {abbr: pass_rank}
+    """
+    rush_sorted = sorted(raw_rush, key=raw_rush.get, reverse=True)
+    pass_sorted = sorted(raw_pass, key=raw_pass.get, reverse=True)
+
+    off_rush_ranks = {abbr: (rush_sorted.index(abbr) + 1) for abbr in rush_sorted}
+    off_pass_ranks = {abbr: (pass_sorted.index(abbr) + 1) for abbr in pass_sorted}
+
+    return off_rush_ranks, off_pass_ranks
+
+
+def load_team_stats():
+    """Load all team stats and extract offensive/defensive ranks"""
+
+    # Pass 1: collect raw offensive values across all 32 teams
+    raw_rush_values = {}
+    raw_pass_values = {}
+    raw_data_cache = {}
+
+    for espn_team_id, team_info in team_lookup.items():
+        abbreviation = team_info["abbreviation"]
+        filename = f"team_stats_aggragated_{abbreviation}.json"
+        filepath = team_stats_directory / filename
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_data_cache[espn_team_id] = data
+
+            own_categories = data["results"]["stats"]["categories"]
+            raw_rush_values[abbreviation] = extract_stat_value(own_categories, "rushing", "rushingYardsPerGame")
+            raw_pass_values[abbreviation] = extract_stat_value(own_categories, "passing", "passingYardsPerGame")
+
+        except FileNotFoundError:
+            print(f"⚠️ File not found: {filename}")
+        except Exception as e:
+            print(f"⚠️ Error reading {filename}: {e}")
+
+    # Pass 2: rank all teams relative to each other
+    off_rush_ranks, off_pass_ranks = compute_offensive_ranks(raw_rush_values, raw_pass_values)
+
+    print(f"\n📊 Offensive rank sample (rush): { {k: off_rush_ranks[k] for k in list(off_rush_ranks)[:5]} }")
+    print(f"📊 Offensive rank sample (pass):  { {k: off_pass_ranks[k] for k in list(off_pass_ranks)[:5]} }\n")
+
+    # Pass 3: build full team stats list using cached data + computed ranks
+    team_stats_list = []
+
+    for espn_team_id, team_info in team_lookup.items():
+        abbreviation = team_info["abbreviation"]
+
+        rushing_off_rank = off_rush_ranks.get(abbreviation, 99)
+        passing_off_rank = off_pass_ranks.get(abbreviation, 99)
+
+        if espn_team_id in raw_data_cache:
+            data = raw_data_cache[espn_team_id]
+            opponent_categories = data["results"]["opponent"]
+            rushing_def_rank = extract_stat_rank(opponent_categories, "rushing", "rushingYardsPerGame")
+            passing_def_rank = extract_stat_rank(opponent_categories, "passing", "passingYardsPerGame")
+        else:
+            rushing_def_rank = 99
+            passing_def_rank = 99
+
+        team_stats_list.append({
+            "espn_team_id": espn_team_id,
+            "team_abbr": abbreviation,
+            "team_display_name": team_info["displayName"],
+            "own_rushing_off_rank": rushing_off_rank,
+            "own_passing_off_rank": passing_off_rank,
+            "opp_rushing_def_rank": rushing_def_rank,
+            "opp_passing_def_rank": passing_def_rank
+        })
+
+        print(f"✅ {abbreviation}: Rush Off={rushing_off_rank}, Pass Off={passing_off_rank}, Rush Def={rushing_def_rank}, Pass Def={passing_def_rank}")
+
+    df_team_stats = pd.DataFrame(team_stats_list)
+    df_team_stats.set_index("espn_team_id", inplace=True)
+
+    return df_team_stats
+
+
+def extract_additional_stats(team_stats_directory, team_lookup):
+    """
+    Extracts points per game, own red zone TD%, and opponent red zone TD% allowed
+    directly from the team stat JSONs.
+
+    Returns a dict keyed by team abbreviation:
+    {
+        "BUF": {
+            "points_per_game": 27.7,
+            "own_redzone_td_pct": 56.92,
+            "opp_redzone_td_pct_allowed": 65.15
+        }, ...
+    }
+    """
+    additional_stats = {}
+
+    for espn_team_id, team_info in team_lookup.items():
+        abbreviation = team_info["abbreviation"]
+        filename = f"team_stats_aggragated_{abbreviation}.json"
+        filepath = team_stats_directory / filename
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Points per game — from stats → passing
+            points_per_game = 99.0
+            for cat in data["results"]["stats"]["categories"]:
+                if cat["name"] == "passing":
+                    for stat in cat["stats"]:
+                        if stat["name"] == "totalPointsPerGame":
+                            points_per_game = round(float(stat.get("value", 99)), 1)
+                    break
+
+            # Own red zone TD% — from stats → miscellaneous
+            own_rz_td_pct = 99.0
+            for cat in data["results"]["stats"]["categories"]:
+                if cat["name"] == "miscellaneous":
+                    for stat in cat["stats"]:
+                        if stat["name"] == "redzoneTouchdownPct":
+                            own_rz_td_pct = round(float(stat.get("value", 99)), 2)
+                    break
+
+            # Opponent red zone TD% allowed — from opponent → miscellaneous
+            opp_rz_td_pct = 99.0
+            for cat in data["results"]["opponent"]:
+                if cat["name"] == "miscellaneous":
+                    for stat in cat["stats"]:
+                        if stat["name"] == "redzoneTouchdownPct":
+                            opp_rz_td_pct = round(float(stat.get("value", 99)), 2)
+                    break
+
+            additional_stats[abbreviation] = {
+                "points_per_game": points_per_game,
+                "own_redzone_td_pct": own_rz_td_pct,
+                "opp_redzone_td_pct_allowed": opp_rz_td_pct
+            }
+
+            print(f"✅ {abbreviation}: PPG={points_per_game}, Own RZ TD%={own_rz_td_pct}, Opp RZ TD% Allowed={opp_rz_td_pct}")
+
+        except FileNotFoundError:
+            print(f"⚠️ File not found: {filename}")
+            additional_stats[abbreviation] = {
+                "points_per_game": 99.0,
+                "own_redzone_td_pct": 99.0,
+                "opp_redzone_td_pct_allowed": 99.0
+            }
+        except Exception as e:
+            print(f"⚠️ Error loading {filename}: {e}")
+            additional_stats[abbreviation] = {
+                "points_per_game": 99.0,
+                "own_redzone_td_pct": 99.0,
+                "opp_redzone_td_pct_allowed": 99.0
+            }
+
+    return additional_stats
+
+
+# -------------------------
+# LOAD ALL STATS
+# -------------------------
+
+df_team_stats = load_team_stats()
+print(f"\n✅ Loaded team stats for {len(df_team_stats)} teams\n")
+
+additional_stats = extract_additional_stats(team_stats_directory, team_lookup)
+print(f"\n✅ Loaded additional stats for {len(additional_stats)} teams\n")
+
+# -------------------------
+# MERGE TEAM STATS WITH PLAYERS
+# -------------------------
+
+# Step 1: build opponent ESPN ID from opponent name — must happen before any merges
+name_to_espn_id = {v["displayName"]: k for k, v in team_lookup.items()}
+df_players["opponent_espn_id"] = df_players["opponent_name"].map(name_to_espn_id)
+
+# Step 2: merge own team offensive ranks
+df_players = df_players.merge(
+    df_team_stats[["own_rushing_off_rank", "own_passing_off_rank"]],
+    left_on="espn_team_id",
+    right_index=True,
+    how="left"
+)
+
+# Step 3: merge opponent defensive ranks
+df_players = df_players.merge(
+    df_team_stats[["opp_rushing_def_rank", "opp_passing_def_rank"]],
+    left_on="opponent_espn_id",
+    right_index=True,
+    how="left",
+    suffixes=("", "_opponent")
+)
+
+df_players.rename(columns={
+    "opp_rushing_def_rank": "opponent_rushing_def_rank",
+    "opp_passing_def_rank": "opponent_passing_def_rank"
+}, inplace=True)
+
+# Step 4: map additional stats onto players using ESPN team IDs
+df_players["points_per_game"] = df_players["espn_team_id"].map(
+    lambda eid: additional_stats.get(team_lookup.get(eid, {}).get("abbreviation", ""), {}).get("points_per_game", 99.0)
+)
+df_players["own_redzone_td_pct"] = df_players["espn_team_id"].map(
+    lambda eid: additional_stats.get(team_lookup.get(eid, {}).get("abbreviation", ""), {}).get("own_redzone_td_pct", 99.0)
+)
+df_players["opp_redzone_td_pct_allowed"] = df_players["opponent_espn_id"].map(
+    lambda eid: additional_stats.get(team_lookup.get(str(eid), {}).get("abbreviation", ""), {}).get("opp_redzone_td_pct_allowed", 99.0)
+)
+
+# Step 5: fill and cast columns
+df_players["own_rushing_off_rank"] = df_players["own_rushing_off_rank"].fillna(99).astype(int)
+df_players["own_passing_off_rank"] = df_players["own_passing_off_rank"].fillna(99).astype(int)
+df_players["opponent_rushing_def_rank"] = df_players["opponent_rushing_def_rank"].fillna(99).astype(int)
+df_players["opponent_passing_def_rank"] = df_players["opponent_passing_def_rank"].fillna(99).astype(int)
+df_players["points_per_game"] = df_players["points_per_game"].fillna(99.0)
+df_players["own_redzone_td_pct"] = df_players["own_redzone_td_pct"].fillna(99.0)
+df_players["opp_redzone_td_pct_allowed"] = df_players["opp_redzone_td_pct_allowed"].fillna(99.0)
+
+print(f"✅ Merged all stats with {len(df_players)} players")
+print(f"\nSample:")
+print(df_players[["player_name", "position", "opponent_name",
+                   "points_per_game", "own_rushing_off_rank", "own_passing_off_rank",
+                   "opponent_rushing_def_rank", "opponent_passing_def_rank",
+                   "own_redzone_td_pct", "opp_redzone_td_pct_allowed"]].head(5))
+
+# -------------------------
+# BUILD ROWS FOR SHEET
+# -------------------------
+
+# Columns L-P written together
+lp_rows = []
+for _, player in df_players.iterrows():
+    row = [
+        float(player["points_per_game"]),            # Column L
+        int(player["opponent_rushing_def_rank"]),    # Column M
+        int(player["opponent_passing_def_rank"]),    # Column N
+        int(player["own_passing_off_rank"]),         # Column O
+        int(player["own_rushing_off_rank"]),         # Column P
+    ]
+    lp_rows.append(row)
+
+# Columns T-U written separately to avoid overwriting Q-S (populated by Script 1)
+tu_rows = []
+for _, player in df_players.iterrows():
+    row = [
+        float(player["own_redzone_td_pct"]),         # Column T
+        float(player["opp_redzone_td_pct_allowed"])  # Column U
+    ]
+    tu_rows.append(row)
+
+# -------------------------
+# WRITE TO SHEET
+# -------------------------
+
+DATA_START_ROW = 2
+start_row = DATA_START_ROW + 1  # Row 3
+end_row = start_row + len(lp_rows) - 1
+
+sheet.batch_clear(["L3:P1000", "T3:U1000"])
+
+sheet.update(f"L{start_row}:P{end_row}", lp_rows)
+print(f"\n📊 Written {len(lp_rows)} rows to L{start_row}:P{end_row}")
+
+sheet.update(f"T{start_row}:U{end_row}", tu_rows)
+print(f"📊 Written {len(tu_rows)} rows to T{start_row}:U{end_row}")
+
+print("\n✅ Team stats written to sheet!")
+print(f"\nColumns written:")
+print(f"   L: Team Points Per Game")
+print(f"   M: Opponent Rushing Defense Rank")
+print(f"   N: Opponent Passing Defense Rank")
+print(f"   O: Own Team Passing Offense Rank")
+print(f"   P: Own Team Rushing Offense Rank")
+print(f"   T: Own Team Red Zone TD%")
+print(f"   U: Opponent Red Zone TD% Allowed")
