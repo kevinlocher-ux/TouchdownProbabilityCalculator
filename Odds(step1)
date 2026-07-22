@@ -1,0 +1,616 @@
+import requests
+from collections import defaultdict
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from gspread.utils import rowcol_to_a1
+import pandas as pd
+
+Current_week = 1
+Previous_week = Current_week - 1
+
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = ServiceAccountCredentials.from_json_keyfile_name(
+    "credentials.json", scope
+)
+client = gspread.authorize(creds)
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+
+BOOK_ID_MAP = {
+    15: "Concensus",
+    30: "Hard Rock",
+    49: "Caesars",
+    68: "DraftKings",
+    69: "FanDuel",
+    75: "BetMGM",
+}
+
+EXPECTED_BOOKS = list(BOOK_ID_MAP.values())
+VALID_POSITIONS = {"RB", "WR", "TE", "QB"}
+BET_TYPE = "core_bet_type_62_anytime_touchdown_scorer"
+
+# -------------------------
+# REQUEST
+# -------------------------
+
+url = "https://api.actionnetwork.com/web/v2/scoreboard/nfl/markets"
+params = {
+    "customPickTypes": BET_TYPE,
+    "seasonType": "reg",
+    "week": Current_week,
+}
+headers = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+data = requests.get(url, params=params, headers=headers).json()
+
+# -------------------------
+# INGEST ODDS
+# -------------------------
+
+player_odds = defaultdict(dict)
+
+for book_id_str, book_payload in data["markets"].items():
+    book_id = int(book_id_str)
+    book_name = BOOK_ID_MAP.get(book_id)
+
+    if not book_name:
+        continue
+
+    event = book_payload.get("event", {})
+    rows = event.get(BET_TYPE, [])
+
+    for row in rows:
+        pid = row.get("player_id")
+        odds = row.get("odds")
+
+        if pid is not None and odds is not None:
+            player_odds[pid][book_name] = odds
+
+
+# -------------------------
+# PRINT PLAYERS + ODDS
+# -------------------------
+
+Filtered_List = [
+    player for player in data["players"]
+    if player.get("position") in VALID_POSITIONS and player.get("id") in player_odds
+]
+
+
+printed = 0
+filtered_players = 0
+
+for player in data["players"]:
+    if player.get("position") not in VALID_POSITIONS:
+        continue
+
+    pid = player.get("id")
+    if pid not in player_odds:
+        continue
+
+    filtered_players += 1
+
+    if printed < 10:
+        print(player["full_name"])
+        for book in EXPECTED_BOOKS:
+            print(f"     {book} odds: {player_odds[pid].get(book, 'N/A')}")
+        print()
+        printed += 1
+
+print(f"Total RB/WR/TE/QB players: {filtered_players}")
+
+sheet = client.open("Anytime TD Bot").worksheet(f"Week{Current_week}_2026") # CHANGE THIS SHIT LATER
+
+DATA_START_ROW = 2
+DATA_START_COLUMN = 2
+start_cell = rowcol_to_a1(DATA_START_ROW, DATA_START_COLUMN)
+
+
+from gspread.utils import rowcol_to_a1
+
+start_cell = rowcol_to_a1(DATA_START_ROW, DATA_START_COLUMN)
+
+
+BOOKS = [
+    "Concensus",
+    "Hard Rock",
+    "Caesars",
+    "DraftKings",
+    "FanDuel",
+    "BetMGM",
+]
+
+rows = []
+
+# Header row
+rows.append(["Player", "Position"] + BOOKS)
+
+for player in data["players"]:
+    position = player.get("position")
+    if position not in {"RB", "WR", "TE", "QB"}:
+        continue
+
+    pid = player.get("id")
+    if pid not in player_odds:
+        continue
+
+    row = [
+        str(player["full_name"]),
+        str(position),
+    ]
+
+    for book in BOOKS:
+        odds = player_odds[pid].get(book)
+        # only integers, else "N/A"
+        row.append(str(odds) if isinstance(odds, int) else "N/A")
+
+    rows.append(row)
+
+
+import json
+for row in rows:
+    for cell in row:
+        json.dumps(cell)  # will throw if anything is not JSON-serializable
+
+
+from gspread.utils import rowcol_to_a1
+start_cell = rowcol_to_a1(DATA_START_ROW, DATA_START_COLUMN)
+
+#print(type(rows))          # must be list
+#print(type(rows[0]))       # must be list
+#print(rows[0])             # should be header row
+#print(rows[1])             # first player row
+
+
+
+sheet.batch_clear(["B3:Y1000"])
+sheet.update(start_cell, rows)
+
+
+
+
+
+## ------------------------------------------------------------------------------##
+##                       DO NOT UPDATE ANYTHING ABOVE THIS BREAK                 ##
+## ------------------------------------------------------------------------------##
+
+import requests, json
+
+
+#ESPN Scoreboard Data Fetch (uncomment to refresh data)
+#url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+#params = {"seasontype": 2, "week": 13}
+
+#data = requests.get(url, params=params).json()
+
+#with open("scoreboard_week13.json", "w", encoding="utf-8") as f:
+#    json.dump(data, f, indent=2)
+
+
+#ESPN Team Statistics Fetch (uncomment to refresh data)
+#url = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/teams/21/statistics"
+#params = {"seasontype": 2}
+#data2 = requests.get(url, params=params).json()
+#with open("team_stats_aggragated_PHI(1).json", "w", encoding="utf-8") as f:
+#    json.dump(data2, f, indent=2)
+
+
+#ESPN Roster Fetch (uncomment to refresh data)
+#url = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/teams/21/roster"
+#data3 = requests.get(url).json()
+#with open("team_roster_PHI.json", "w", encoding="utf-8") as f:
+#    json.dump(data3, f, indent=2)
+
+#ESPN Depth Chart Fetch (uncomment to refresh data)
+#url = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/teams/21/depthcharts"
+#data4 = requests.get(url).json()
+#with open("team_depthchart_PHI.json", "w", encoding="utf-8") as f:
+#    json.dump(data4, f, indent=2)
+
+
+import json
+import pathlib
+import pandas as pd
+from datetime import datetime
+from gspread.utils import rowcol_to_a1
+
+# -------------------------
+# LOAD ESPN SCOREBOARDS
+# -------------------------
+
+Base_directory = pathlib.Path(__file__).parent
+scoreboard_path_current = Base_directory /  "Scoreboards" / f"scoreboard_week{Current_week}.json"
+scoreboard_path_previous = Base_directory /  "Scoreboards" / f"scoreboard_week{Previous_week}.json"
+
+with open(scoreboard_path_current, "r", encoding="utf-8") as f:
+    data_current = json.load(f)
+
+with open(scoreboard_path_previous, "r", encoding="utf-8") as f:
+    data_previous = json.load(f)
+
+
+# -------------------------
+# TEAM LOOKUP
+# -------------------------
+
+team_lookup = {
+    "2": {"abbreviation": "BUF", "displayName": "Buffalo Bills", "name": "Bills", "division": "AFC East", "location": "Buffalo", "AN ID": "125", "ESPN ID": "2"},
+    "20": {"abbreviation": "NYJ", "displayName": "New York Jets", "name": "Jets", "division": "AFC East", "location": "New York", "AN ID": "127", "ESPN ID": "20"},
+    "15": {"abbreviation": "MIA", "displayName": "Miami Dolphins", "name": "Dolphins", "division": "AFC East", "location": "Miami", "AN ID": "126", "ESPN ID": "15"},
+    "17": {"abbreviation": "NE", "displayName": "New England Patriots", "name": "Patriots", "division": "AFC East", "location": "New England", "AN ID": "129", "ESPN ID": "17"},
+    "7": {"abbreviation": "DEN", "displayName": "Denver Broncos", "name": "Broncos", "division": "AFC West", "location": "Denver", "AN ID": "136", "ESPN ID": "7"},
+    "12": {"abbreviation": "KC", "displayName": "Kansas City Chiefs", "name": "Chiefs", "division": "AFC West", "location": "Kansas City", "AN ID": "139", "ESPN ID": "12"},
+    "13": {"abbreviation": "LV", "displayName": "Las Vegas Raiders", "name": "Raiders", "division": "AFC West", "location": "Las Vegas", "AN ID": "2045", "ESPN ID": "13"},
+    "24": {"abbreviation": "LAC", "displayName": "Los Angeles Chargers", "name": "Chargers", "division": "AFC West", "location": "Los Angeles", "AN ID": "1325", "ESPN ID": "24"},
+    "23": {"abbreviation": "PIT", "displayName": "Pittsburgh Steelers", "name": "Steelers", "division": "AFC North", "location": "Pittsburgh", "AN ID": "132", "ESPN ID": "23"},
+    "4": {"abbreviation": "CIN", "displayName": "Cincinnati Bengals", "name": "Bengals", "division": "AFC North", "location": "Cincinnati", "AN ID": "128", "ESPN ID": "4"},
+    "33": {"abbreviation": "BAL", "displayName": "Baltimore Ravens", "name": "Ravens", "division": "AFC North", "location": "Baltimore", "AN ID": "131", "ESPN ID": "33"},
+    "5": {"abbreviation": "CLE", "displayName": "Cleveland Browns", "name": "Browns", "division": "AFC North", "location": "Cleveland", "AN ID": "130", "ESPN ID": "5"},
+    "11": {"abbreviation": "IND", "displayName": "Indianapolis Colts", "name": "Colts", "division": "AFC South", "location": "Indianapolis", "AN ID": "133", "ESPN ID": "11"},
+    "34": {"abbreviation": "HOU", "displayName": "Houston Texans", "name": "Texans", "division": "AFC South", "location": "Houston", "AN ID": "137", "ESPN ID": "34"},
+    "10": {"abbreviation": "TEN", "displayName": "Tennessee Titans", "name": "Titans", "division": "AFC South", "location": "Tennessee", "AN ID": "135", "ESPN ID": "10"},
+    "30": {"abbreviation": "JAX", "displayName": "Jacksonville Jaguars", "name": "Jaguars", "division": "AFC South", "location": "Jacksonville", "AN ID": "134", "ESPN ID": "30"},
+    "3": {"abbreviation": "CHI", "displayName": "Chicago Bears", "name": "Bears", "division": "NFC North", "location": "Chicago", "AN ID": "143", "ESPN ID": "3"},
+    "9": {"abbreviation": "GB", "displayName": "Green Bay Packers", "name": "Packers", "division": "NFC North", "location": "Green Bay", "AN ID": "147", "ESPN ID": "9"},
+    "16": {"abbreviation": "MIN", "displayName": "Minnesota Vikings", "name": "Vikings", "division": "NFC North", "location": "Minnesota", "AN ID": "148", "ESPN ID": "16"},
+    "8": {"abbreviation": "DET", "displayName": "Detroit Lions", "name": "Lions", "division": "NFC North", "location": "Detroit", "AN ID": "146", "ESPN ID": "8"},
+    "27": {"abbreviation": "TB", "displayName": "Tampa Bay Buccaneers", "name": "Buccaneers", "division": "NFC South", "location": "Tampa Bay", "AN ID": "149", "ESPN ID": "27"},
+    "29": {"abbreviation": "CAR", "displayName": "Carolina Panthers", "name": "Panthers", "division": "NFC South", "location": "Carolina", "AN ID": "150", "ESPN ID": "29"},
+    "18": {"abbreviation": "NO", "displayName": "New Orleans Saints", "name": "Saints", "division": "NFC South", "location": "New Orleans", "AN ID": "152", "ESPN ID": "18"},
+    "1": {"abbreviation": "ATL", "displayName": "Atlanta Falcons", "name": "Falcons", "division": "NFC South", "location": "Atlanta", "AN ID": "151", "ESPN ID": "1"},
+    "25": {"abbreviation": "SF", "displayName": "San Francisco 49ers", "name": "49ers", "division": "NFC West", "location": "San Francisco", "AN ID": "154", "ESPN ID": "25"},
+    "26": {"abbreviation": "SEA", "displayName": "Seattle Seahawks", "name": "Seahawks", "division": "NFC West", "location": "Seattle", "AN ID": "156", "ESPN ID": "26"},
+    "22": {"abbreviation": "ARI", "displayName": "Arizona Cardinals", "name": "Cardinals", "division": "NFC West", "location": "Arizona", "AN ID": "153", "ESPN ID": "22"},
+    "14": {"abbreviation": "LAR", "displayName": "Los Angeles Rams", "name": "Rams", "division": "NFC West", "location": "Los Angeles", "AN ID": "251", "ESPN ID": "14"},
+    "28": {"abbreviation": "WSH", "displayName": "Washington Commanders", "name": "Commanders", "division": "NFC East", "location": "Washington", "AN ID": "145", "ESPN ID": "28"},
+    "19": {"abbreviation": "NYG", "displayName": "New York Giants", "name": "Giants", "division": "NFC East", "location": "New York", "AN ID": "144", "ESPN ID": "19"},
+    "6": {"abbreviation": "DAL", "displayName": "Dallas Cowboys", "name": "Cowboys", "division": "NFC East", "location": "Dallas", "AN ID": "140", "ESPN ID": "6"},
+    "21": {"abbreviation": "PHI", "displayName": "Philadelphia Eagles", "name": "Eagles", "division": "NFC East", "location": "Philadelphia", "AN ID": "142", "ESPN ID": "21"}
+}
+
+# Reverse mapping from AN ID → ESPN ID
+AN_TO_ESPN = {v["AN ID"]: v["ESPN ID"] for v in team_lookup.values()}
+
+
+# -------------------------
+# COLUMN INDICES
+# -------------------------
+
+COL_Player = 0
+COL_Position = 1
+COL_Opponent = 8
+COL_Location = 9
+COL_Last_Week = 10
+COL_Opposing_Def_Rush_Rank = 11
+COL_Opposing_Def_Pass_Rank = 12
+COL_Own_off_Pass_Rank = 13
+COL_Own_off_Rush_Rank = 14
+Division_Game = 15
+Oppononet_Coming_off_Bye = 16
+Own_team_coming_off_bye = 17
+Own_QB_rank = 18
+Team_RZ_Pass_Percent = 19
+Own_Team_short_week = 20
+Opponent_Short_Week = 21
+Own_Team_long_week = 22
+Opponent_Long_Week = 23
+TOTAL_COLS = 24
+
+
+# -------------------------
+# PARSE GAMES INTO DATAFRAME
+# -------------------------
+
+def parse_scoreboard_to_df(scoreboard_data):
+    """Parse ESPN scoreboard JSON into a pandas DataFrame of team-level game info"""
+    
+    games_list = []
+    
+    for event in scoreboard_data.get("events", []):
+        competition = event["competitions"][0]
+        competitors = competition["competitors"]
+        
+        neutral = competition.get("neutralSite", False)
+        event_id = event.get("id")
+        game_date = event.get("date")
+        
+        for competitor in competitors:
+            team_id = competitor["team"]["id"]
+            opponent = [c for c in competitors if c["team"]["id"] != team_id][0]
+            opponent_id = opponent["team"]["id"]
+            
+            games_list.append({
+                "team_id": team_id,
+                "opponent_id": opponent_id,
+                "home_away": competitor["homeAway"],
+                "neutral": neutral,
+                "event_id": event_id,
+                "game_date": game_date
+            })
+    
+    return pd.DataFrame(games_list)
+
+
+df_current = parse_scoreboard_to_df(data_current)
+df_previous = parse_scoreboard_to_df(data_previous)
+
+print(f"✅ Parsed Week {Current_week}: {len(df_current)} team-game records")
+print(f"✅ Parsed Week {Previous_week}: {len(df_previous)} team-game records")
+
+
+# -------------------------
+# BUILD TEAM SCHEDULE CONTEXT DATAFRAME
+# -------------------------
+
+def calculate_days_between(date_str_1, date_str_2):
+    """Calculate days between two ISO format date strings"""
+    try:
+        dt1 = datetime.fromisoformat(date_str_1.replace("Z", "+00:00"))
+        dt2 = datetime.fromisoformat(date_str_2.replace("Z", "+00:00"))
+        return (dt2 - dt1).days
+    except:
+        return None
+
+
+team_context_list = []
+
+for espn_team_id in team_lookup.keys():
+    
+    # Get current week game for this team
+    current_game = df_current[df_current["team_id"] == espn_team_id]
+    
+    if current_game.empty:
+        # Team on BYE this week
+        team_context_list.append({
+            "espn_team_id": espn_team_id,
+            "opponent_name": "BYE",
+            "location": "BYE",
+            "division_game": 0,
+            "came_off_bye": 0,
+            "short_week": 0,
+            "long_week": 0,
+            "opponent_came_off_bye": 0,
+            "opponent_short_week": 0,
+            "opponent_long_week": 0
+        })
+        continue
+    
+    current_game = current_game.iloc[0]  # Get first (only) row
+    opponent_id = str(current_game["opponent_id"])
+    
+    # Opponent name
+    opponent_name = team_lookup.get(opponent_id, {}).get("displayName", "Unknown")
+    
+    # Location
+    if current_game["neutral"]:
+        location = 50
+    else:
+        location = 100 if current_game["home_away"] == "home" else 0
+    
+    # Division game
+    team_div = team_lookup.get(espn_team_id, {}).get("division")
+    opp_div = team_lookup.get(opponent_id, {}).get("division")
+    division_game = 100 if team_div == opp_div else 0
+    
+    # --- Schedule features for THIS TEAM ---
+    last_week_game = df_previous[df_previous["team_id"] == espn_team_id]
+    
+    if last_week_game.empty:
+        # Did NOT play previous week → came off bye
+        came_off_bye = 100
+        short_week = 0
+        long_week = 0
+    else:
+        came_off_bye = 0
+        last_week_game = last_week_game.iloc[0]
+        
+        days = calculate_days_between(
+            last_week_game["game_date"],
+            current_game["game_date"]
+        )
+        
+        short_week = 100 if (days is not None and days < 7) else 0
+        long_week = 100 if (days is not None and days > 7) else 0
+    
+    # --- Schedule features for OPPONENT ---
+    opponent_last_week_game = df_previous[df_previous["team_id"] == opponent_id]
+    
+    if opponent_last_week_game.empty:
+        opponent_came_off_bye = 100
+        opponent_short_week = 0
+        opponent_long_week = 0
+    else:
+        opponent_came_off_bye = 0
+        opponent_last_week_game = opponent_last_week_game.iloc[0]
+        
+        opp_days = calculate_days_between(
+            opponent_last_week_game["game_date"],
+            current_game["game_date"]
+        )
+        
+        opponent_short_week = 100 if (opp_days is not None and opp_days < 7) else 0
+        opponent_long_week = 100 if (opp_days is not None and opp_days > 7) else 0
+    
+    # Store context
+    team_context_list.append({
+        "espn_team_id": espn_team_id,
+        "opponent_name": opponent_name,
+        "location": location,
+        "division_game": division_game,
+        "came_off_bye": came_off_bye,
+        "short_week": short_week,
+        "long_week": long_week,
+        "opponent_came_off_bye": opponent_came_off_bye,
+        "opponent_short_week": opponent_short_week,
+        "opponent_long_week": opponent_long_week
+    })
+
+# Convert to DataFrame
+df_team_context = pd.DataFrame(team_context_list)
+df_team_context.set_index("espn_team_id", inplace=True)
+
+print(f"✅ Built team context for {len(df_team_context)} teams")
+print(f"\nSample team context:")
+print(df_team_context.head(3))
+
+
+
+# -------------------------
+# BUILD PLAYER DATAFRAME FROM FILTERED_LIST
+# -------------------------
+# Note: Filtered_List comes from Action Network API (assumed to exist from earlier in script)
+
+player_data_list = []
+
+for player in Filtered_List:
+    an_team_id = str(player.get("team_id"))
+    espn_team_id = AN_TO_ESPN.get(an_team_id)
+    
+    player_data_list.append({
+        "player_name": player.get("full_name", "Unknown"),
+        "position": player.get("position", "Unknown"),
+        "an_team_id": an_team_id,
+        "espn_team_id": espn_team_id
+    })
+
+df_players = pd.DataFrame(player_data_list)
+
+print(f"\n✅ Built player dataframe: {len(df_players)} players")
+
+
+
+
+# -------------------------
+# JOIN PLAYERS WITH TEAM CONTEXT
+# -------------------------
+
+df_players = df_players.merge(
+    df_team_context,
+    left_on="espn_team_id",
+    right_index=True,
+    how="left"
+)
+
+# Fill missing values for players with no ESPN team mapping
+df_players["opponent_name"] = df_players["opponent_name"].fillna("ERROR")
+df_players["location"] = df_players["location"].fillna(0)
+df_players["division_game"] = df_players["division_game"].fillna(0)
+df_players["came_off_bye"] = df_players["came_off_bye"].fillna(0)
+df_players["short_week"] = df_players["short_week"].fillna(0)
+df_players["long_week"] = df_players["long_week"].fillna(0)
+df_players["opponent_came_off_bye"] = df_players["opponent_came_off_bye"].fillna(0)
+df_players["opponent_short_week"] = df_players["opponent_short_week"].fillna(0)
+df_players["opponent_long_week"] = df_players["opponent_long_week"].fillna(0)
+
+print(f"\n✅ Merged players with team context")
+print(f"\nSample player data:")
+print(df_players.head(3))
+
+# Check for players with missing ESPN mapping
+missing_mapping = df_players[df_players["espn_team_id"].isna()]
+if not missing_mapping.empty:
+    print(f"\n⚠️ {len(missing_mapping)} players with missing ESPN team mapping:")
+    for _, row in missing_mapping.iterrows():
+        print(f"   {row['player_name']} (AN ID: {row['an_team_id']})")
+
+
+# -------------------------
+# CONVERT TO SHEET FORMAT
+# -------------------------
+
+# We only need to write columns J onwards (Opponent, Location, etc.)
+# Columns B-I already have Player, Position, and Odds
+
+rows = []
+
+for _, player in df_players.iterrows():
+    # Start the row at COL_Opponent (index 8)
+    # This means we skip Player (0), Position (1), and the 6 odds columns (2-7)
+    row = [""] * (TOTAL_COLS - COL_Opponent)
+    
+    # Fill in features (indices adjusted for starting at COL_Opponent)
+    row[0] = player["opponent_name"]  # COL_Opponent
+    row[1] = int(player["location"]) if player["location"] not in ["BYE", "ERROR"] else player["location"]  # COL_Location
+    row[2] = ""  # COL_Last_Week (not implemented yet)
+    row[3] = ""  # COL_Opposing_Def_Rush_Rank
+    row[4] = ""  # COL_Opposing_Def_Pass_Rank
+    row[5] = ""  # COL_Own_off_Pass_Rank
+    row[6] = ""  # COL_Own_off_Rush_Rank
+    row[7] = int(player["division_game"])  # Division_Game
+    row[8] = int(player["opponent_came_off_bye"])  # Oppononet_Coming_off_Bye
+    row[9] = int(player["came_off_bye"])  # Own_team_coming_off_bye
+    row[10] = ""  # Own_QB_rank
+    row[11] = ""  # Team_RZ_Pass_Percent
+    row[12] = int(player["short_week"])  # Own_Team_short_week
+    row[13] = int(player["opponent_short_week"])  # Opponent_Short_Week
+    row[14] = int(player["long_week"])  # Own_Team_long_week
+    row[15] = int(player["opponent_long_week"])  # Opponent_Long_Week
+    
+    rows.append(row)
+
+print(f"\n✅ Converted {len(rows)} players to sheet format")
+
+
+# -------------------------
+# WRITE TO GOOGLE SHEET
+# -------------------------
+
+DATA_START_ROW = 2
+start_row = DATA_START_ROW + 1
+end_row = start_row + len(rows) - 1
+
+# Start writing from column J (COL_Opponent + DATA_START_COLUMN)
+start_col_index = DATA_START_COLUMN + COL_Opponent  # 2 + 8 = 10 (column J)
+end_col_index = DATA_START_COLUMN + TOTAL_COLS - 1
+
+start_col_letter = chr(ord('A') + start_col_index - 1)  # J
+end_col_letter = chr(ord('A') + end_col_index - 1)
+
+range_name = f"{start_col_letter}{start_row}:{end_col_letter}{end_row}"
+
+print(f"\n📊 Writing to sheet range: {range_name}")
+print(f"   (This preserves odds in columns D-I)")
+
+# Uncomment to actually write:
+sheet.update(range_name, rows)
+
+print("✅ Ready to write to sheet!")
+print(f"\n🎯 Schedule features added:")
+print(f"   - Own team short week (< 7 days)")
+print(f"   - Own team long week (> 7 days)")
+print(f"   - Opponent short week (< 7 days)")
+print(f"   - Opponent long week (> 7 days)")
+print(f"   - Normal week (7 days) = both short & long = 0")
+
+# At the end of odds scraper, after writing odds to sheet
+
+# Save player-to-team mapping for Script 2
+player_team_mapping = []
+
+for player in Filtered_List:
+    an_team_id = str(player.get("team_id"))
+    espn_team_id = AN_TO_ESPN.get(an_team_id)
+    
+    player_team_mapping.append({
+        "player_name": player.get("full_name"),
+        "position": player.get("position"),
+        "an_team_id": an_team_id,
+        "espn_team_id": espn_team_id
+    })
+
+# Save to JSON file
+import json
+with open("player_team_mapping.json", "w") as f:
+    json.dump(player_team_mapping, f, indent=2)
+
+print(f"✅ Saved team mapping for {len(player_team_mapping)} players")
