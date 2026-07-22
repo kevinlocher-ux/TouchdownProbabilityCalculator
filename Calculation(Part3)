@@ -1,0 +1,433 @@
+import json
+import os
+import glob
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+currentweek = 15
+
+# -------------------------
+# GOOGLE SHEETS AUTH
+# -------------------------
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = ServiceAccountCredentials.from_json_keyfile_name(
+    "credentials.json", scope
+)
+client = gspread.authorize(creds)
+
+sheet = client.open("Anytime TD Bot").worksheet(f"Week{currentweek}_2025") #ALSO CHANGE THIS (Year)
+
+# -------------------------
+# COLUMN NAME CONSTANTS
+# -------------------------
+
+COL_PLAYER   = "Player"    # B
+COL_POSITION = "Position"  # C
+# D (Consensus) — skipped intentionally
+
+ODDS_COLUMNS = [
+    "Hard Rock",   # E
+    "Caesars",     # F
+    "DraftKings",  # G
+    "FanDuel",     # H
+    "BetMGM",      # I
+]
+
+# J = Opponent name — skipped
+
+STAT_COLUMNS = [
+    "Game Location",                        # K
+    "Own Team Points Per Game",             # L
+    "Opposing Defense Rushing Rank",        # M
+    "Opposing Defense Passing rank",        # N
+    "Own passing offense rank",             # O
+    "Own rushing offense rank",             # P
+    "Division Game",                        # Q
+    "Opponent coming off bye? (T/F)",       # R
+    "This team coming off bye? (T/F)",      # S
+    "Red Zone Efficiency (TD %)",           # T
+    "Opposing Defense Red Zone TD Allowed", # U
+    "Own Team Short Week? (T/F)",           # V
+    "Opponent Short Week? (T/F)",           # W
+    "Own Team Long Week? (T/F)",            # X
+    "Opponent Long Week? (T/F)"             # Y
+]
+
+# -------------------------
+# DEPTH CHART PARSING
+# -------------------------
+
+def parse_depth_chart_strings():
+    OFFENSIVE_FORMATION_POSITIONS = {"qb", "rb", "te", "wr1", "wr2", "wr3"}
+    player_ranks = {}
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    depth_chart_dir = os.path.join(script_dir, "Team Depth Charts")
+
+    files = [
+        os.path.join(depth_chart_dir, f)
+        for f in os.listdir(depth_chart_dir)
+        if f.startswith("team_depthchart_") and f.endswith(".json")
+    ]
+
+    if not files:
+        print(f"⚠️  No depth chart files found in {depth_chart_dir}")
+        return player_ranks
+
+    print(f"📂 Found {len(files)} depth chart files")
+
+    for filepath in files:
+        with open(filepath, "r") as f:
+            data = json.load(f)
+
+        for formation in data.get("depthchart", []):
+            positions = formation.get("positions", {})
+
+            # Skip formations that don't contain any offensive skill positions
+            if not any(slot in positions for slot in OFFENSIVE_FORMATION_POSITIONS):
+                continue
+
+            # --- WRs: slot-first flattening ---
+            # Rank 1 = WR1 string 1, Rank 2 = WR2 string 1, Rank 3 = WR3 string 1,
+            # Rank 4 = WR1 string 2, Rank 5 = WR2 string 2, etc.
+            wr_slots = ["wr1", "wr2", "wr3"]
+            present_wr_slots = [s for s in wr_slots if s in positions]
+
+            if present_wr_slots:
+                max_wr_depth = max(
+                    len(positions[slot]["athletes"])
+                    for slot in present_wr_slots
+                )
+
+                wr_rank = 1
+                for string_num in range(max_wr_depth):
+                    for slot in wr_slots:
+                        if slot not in positions:
+                            continue
+                        athletes = positions[slot]["athletes"]
+                        if string_num < len(athletes):
+                            name = athletes[string_num]["displayName"]
+                            if name not in player_ranks or wr_rank < player_ranks[name]:
+                                player_ranks[name] = wr_rank
+                        wr_rank += 1
+
+            # --- RB, TE, QB: simple string depth ---
+            for slot in ["rb", "te", "qb"]:
+                if slot not in positions:
+                    continue
+                for string_num, athlete in enumerate(positions[slot]["athletes"]):
+                    name = athlete["displayName"]
+                    rank = string_num + 1
+                    if name not in player_ranks or rank < player_ranks[name]:
+                        player_ranks[name] = rank
+
+    print(f"✅ Parsed depth chart strings for {len(player_ranks)} players")
+    return player_ranks
+
+# -------------------------
+# READ SHEET
+# -------------------------
+
+raw = sheet.get("B2:Y500")
+
+headers = raw[0]
+data_rows = [row for row in raw[1:] if any(cell.strip() for cell in row)]
+
+df = pd.DataFrame(data_rows, columns=headers)
+
+print(f"✅ Read {len(df)} players from sheet")
+
+# -------------------------
+# DEPTH CHART — map ranks onto df
+# -------------------------
+
+depth_ranks = parse_depth_chart_strings()
+df["depth_rank"] = df[COL_PLAYER].map(depth_ranks)
+
+unmatched = df[df["depth_rank"].isna()][COL_PLAYER].tolist()
+if unmatched:
+    print(f"⚠️  {len(unmatched)} players had no depth chart match: {unmatched}")
+
+# -------------------------
+# AMERICAN ODDS → IMPLIED PROBABILITY (0-100 scale)
+# -------------------------
+
+def american_to_implied(odds_str):
+    """Convert American odds to implied probability as a percentage (0-100)."""
+    try:
+        odds = float(str(odds_str).replace("+", "").strip())
+        if odds >= 0:
+            prob = 100 / (odds + 100)
+        else:
+            prob = abs(odds) / (abs(odds) + 100)
+        return round(prob * 100, 2)
+    except (ValueError, TypeError):
+        return np.nan
+
+for col in ODDS_COLUMNS:
+    if col in df.columns:
+        df[col] = df[col].apply(american_to_implied)
+
+df["consensus_prob"] = df[ODDS_COLUMNS].apply(
+    lambda row: round(np.nanmean(row.tolist()), 2), axis=1
+)
+
+# -------------------------
+# RANK CONVERSIONS
+# -------------------------
+
+def rank_to_pct(rank, higher_is_better=True):
+    """
+    Convert a 1-32 NFL rank to a 0-100 percentage.
+    higher_is_better=True  → rank 1 = 100% (own offensive ranks)
+    higher_is_better=False → rank 1 = 3.1% (opponent defensive ranks,
+                             where rank 32 = worst defense = easiest matchup)
+    """
+    try:
+        rank = int(rank)
+        if higher_is_better:
+            return round((32 - rank + 1) / 32 * 100, 2)
+        else:
+            return round(rank / 32 * 100, 2)
+    except (ValueError, TypeError):
+        return 0.0
+
+# Opponent defensive ranks — rank 32 (worst defense) = easiest matchup = high %
+df["Opposing Defense Rushing Rank"] = df["Opposing Defense Rushing Rank"].apply(
+    lambda x: rank_to_pct(x, higher_is_better=False)
+)
+df["Opposing Defense Passing rank"] = df["Opposing Defense Passing rank"].apply(
+    lambda x: rank_to_pct(x, higher_is_better=False)
+)
+
+# Own offensive ranks — rank 1 (best offense) = high %
+df["Own passing offense rank"] = df["Own passing offense rank"].apply(
+    lambda x: rank_to_pct(x, higher_is_better=True)
+)
+df["Own rushing offense rank"] = df["Own rushing offense rank"].apply(
+    lambda x: rank_to_pct(x, higher_is_better=True)
+)
+
+# -------------------------
+# COERCE STAT COLUMNS TO NUMERIC
+# -------------------------
+
+for col in STAT_COLUMNS:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+df["consensus_prob"] = df["consensus_prob"].fillna(0)
+
+# -------------------------
+# POSITION-SPECIFIC WEIGHTS
+# -------------------------
+
+# Order matches: consensus_prob, Game Location, Own PPG, Opp Def Rush Rank,
+# Opp Def Pass Rank, Own Pass Off Rank, Own Rush Off Rank, Division Game,
+# Opp Off Bye, Own Off Bye, RZ TD Pct, Opp RZ TD Allowed,
+# Own Short Week, Opp Short Week, Own Long Week, Opp Long Week
+
+WEIGHTS_RB = [
+    x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x
+] 
+
+WEIGHTS_WR = [
+    x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x
+]
+
+WEIGHTS_TE = [
+    x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x
+]
+
+WEIGHTS_QB = [
+    x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x,
+      x
+]
+
+STRING_SCALARS_RB = {
+    1: x,
+    2: x,
+    3: x,
+    4: x,
+}
+
+STRING_SCALARS_WR = {
+    1: x,
+    2: x,
+    3: x,
+    4: x,
+}
+
+STRING_SCALARS_TE = {
+    1: x,
+    2: x,
+    3: x,
+    4: x,
+}
+
+
+def weight_sum(weights):
+    return sum(abs(w) for w in weights)
+
+assert weight_sum(WEIGHTS_RB) == weight_sum(WEIGHTS_WR) == \
+       weight_sum(WEIGHTS_TE) == weight_sum(WEIGHTS_QB), \
+    f"Weight absolute sums must match: RB={weight_sum(WEIGHTS_RB)}, " \
+    f"WR={weight_sum(WEIGHTS_WR)}, TE={weight_sum(WEIGHTS_TE)}, QB={weight_sum(WEIGHTS_QB)}"
+
+POSITION_WEIGHTS = {
+    "RB": WEIGHTS_RB,
+    "WR": WEIGHTS_WR,
+    "TE": WEIGHTS_TE,
+    "QB": WEIGHTS_QB,
+}
+
+# -------------------------
+# SCORING
+# -------------------------
+
+def score_players(df, position_weights, stat_columns, include_odds=True):
+    """
+    Calculates a weighted vector magnitude for each player, then applies
+    a depth chart scalar as a post-calculation multiplier.
+
+    Formula: sqrt(w1*x1^2 + w2*x2^2 + ... + wn*xn^2) * depth_scalar
+
+    - Players with any value of 99 in any feature column are skipped (missing data).
+    - Players whose position is not in position_weights are skipped.
+    - depth_rank NaN is treated as rank 1 (starter assumed if no depth chart data).
+    - Players beyond rank 4 for WR/RB/TE use a fallback scalar of 0.20.
+    - QBs have no depth scalar applied.
+    """
+    if include_odds:
+        feature_columns = ["consensus_prob"] + stat_columns
+    else:
+        feature_columns = stat_columns
+
+    scores = []
+    skipped = []
+
+    for _, row in df.iterrows():
+        position = row[COL_POSITION]
+
+        if position not in position_weights:
+            scores.append(np.nan)
+            continue
+
+        params = position_weights[position]
+
+        if len(params) != len(feature_columns):
+            raise ValueError(
+                f"params length ({len(params)}) must match "
+                f"number of feature columns ({len(feature_columns)})"
+            )
+
+        feature_values = row[feature_columns].values.astype(float)
+
+        if 99.0 in feature_values:
+            scores.append(np.nan)
+            skipped.append(row[COL_PLAYER])
+            continue
+
+        weights = np.array(params, dtype=float)
+        weighted_sq = (feature_values ** 2) * weights
+        raw_score = np.sqrt(weighted_sq.sum())
+
+        # Depth rank — default to 1 if missing
+        depth_rank = row["depth_rank"]
+        depth_rank = int(depth_rank) if pd.notna(depth_rank) else 1
+
+        if position == "WR":
+            scalar = STRING_SCALARS_WR.get(depth_rank, 0.20)
+        elif position == "RB":
+            scalar = STRING_SCALARS_RB.get(depth_rank, 0.20)
+        elif position == "TE":
+            scalar = STRING_SCALARS_TE.get(depth_rank, 0.20)
+        else:
+            scalar = 1.0  # QB — no scalar applied
+
+        scores.append(raw_score * scalar)
+
+    if skipped:
+        print(f"⚠️  Skipped {len(skipped)} players due to missing data: {skipped}")
+
+    df = df.copy()
+    df["score"] = scores
+    return df
+
+df_scored = score_players(df, POSITION_WEIGHTS, STAT_COLUMNS, include_odds=True)
+
+print(df_scored[[COL_PLAYER, COL_POSITION, "depth_rank", "consensus_prob", "score"]]
+      .dropna(subset=["score"])
+      .sort_values("score", ascending=False)
+      .head(50))
+
+import glob
+print(glob.glob("team_depthchart_*.json"))
